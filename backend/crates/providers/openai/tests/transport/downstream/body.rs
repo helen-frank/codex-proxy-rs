@@ -87,6 +87,54 @@ fn encoder_should_preserve_explicit_store_values() {
     }
 }
 
+#[test]
+fn encoder_should_convert_system_messages_to_developer_without_changing_content() {
+    let body = json!({
+        "model": "client-model",
+        "input": [
+            {
+                "type": "message",
+                "role": "system",
+                "content": "You are a pirate.",
+                "future_item_field": {"keep": true}
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Say hello."}]
+            },
+            {"type": "computer_screenshot", "role": "system"},
+            "opaque-item"
+        ],
+        "future_top_level_field": {"keep": true}
+    });
+    let encoded = encode_downstream_request(body);
+
+    assert_eq!(
+        Value::Object(encoded.body().clone()),
+        json!({
+            "model": "gpt-test",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": "You are a pirate.",
+                    "future_item_field": {"keep": true}
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Say hello."}]
+                },
+                {"type": "computer_screenshot", "role": "system"},
+                "opaque-item"
+            ],
+            "store": false,
+            "future_top_level_field": {"keep": true}
+        })
+    );
+}
+
 #[tokio::test]
 async fn backend_http_should_send_default_store_for_downstream_request() {
     let listener = TcpListener::bind("127.0.0.1:0")

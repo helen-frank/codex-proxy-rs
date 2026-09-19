@@ -10,6 +10,21 @@ pub(in crate::transport) fn normalize_codex_request_body(body: &mut Map<String, 
     // 官方 Core/Desktop 显式发送 store=false；仅为缺字段的下游请求补齐，保留显式值。
     body.entry("store").or_insert(Value::Bool(false));
 
+    // Codex Responses 不接受 input 中的 system role；developer role 保留同等的
+    // 高优先级指令语义，同时兼容通用 Responses 客户端生成的 message。
+    if let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) {
+        for item in input {
+            let Some(item) = item.as_object_mut() else {
+                continue;
+            };
+            if item.get("type").and_then(Value::as_str) == Some("message")
+                && item.get("role").and_then(Value::as_str) == Some("system")
+            {
+                item.insert("role".to_owned(), Value::String("developer".to_owned()));
+            }
+        }
+    }
+
     for field in [
         // Pi 普通 Responses 适配将 maxTokens 映射为 max_output_tokens，
         // temperature 则原样写入；Pi 的 Codex 适配也可能发送 temperature。
