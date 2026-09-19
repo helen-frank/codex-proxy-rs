@@ -602,6 +602,7 @@ async fn websocket_response_metadata_should_preserve_ordinary_headers_without_bl
                 "x-codex-turn-state",
                 Bytes::from_static(b"turn-state-from-upstream"),
             ),
+            ProviderResponseHeader::new("x-models-etag", Bytes::from_static(b"models-v2")),
             ProviderResponseHeader::new("x-future-bytes", Bytes::from_static(b"\xffopaque")),
             ProviderResponseHeader::new("bad\0name", Bytes::from_static(b"unrepresentable")),
             ProviderResponseHeader::new(
@@ -683,6 +684,7 @@ async fn websocket_response_metadata_should_preserve_ordinary_headers_without_bl
         "x-future-bytes",
         "bad\0name",
         "authorization",
+        "x-models-etag",
         "connection",
         "x-private-hop",
         "content-type",

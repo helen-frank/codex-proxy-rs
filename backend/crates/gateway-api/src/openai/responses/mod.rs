@@ -75,5 +75,8 @@ pub(super) fn response_header_is_forwardable(name: &str, connection_options: &[S
             | "x-openai-project"
             | "x-codex-installation-id"
             | "x-codex-turn-metadata"
+            // Provider-side model-catalog state. Forwarding it makes clients such as
+            // Grok refresh their own model catalog against an unrelated endpoint.
+            | "x-models-etag"
     )
 }

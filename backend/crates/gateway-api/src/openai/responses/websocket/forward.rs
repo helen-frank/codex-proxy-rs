@@ -12,7 +12,10 @@ use tokio::time::Instant;
 use crate::openai::error::{gateway_error_contract, gateway_error_from_engine};
 
 use super::{
-    super::{DecodedResponsesRequest, OpenAiResponsesEncoder, PendingExecution, ProtocolErrorBody},
+    super::{
+        DecodedResponsesRequest, OpenAiResponsesEncoder, PendingExecution, ProtocolErrorBody,
+        response::is_private_provider_event,
+    },
     connection::{FramePhase, ResponsesWebSocketConnection, WriteContext},
     protocol::{error_event, initial_engine_error_event, response_metadata_event},
 };
@@ -64,45 +67,54 @@ pub(super) async fn forward_execution(
         );
         return send_gateway_error(connection, &error, &request_id).await;
     }
-    let first = match next_active_input(connection, &mut execution).await {
-        ActiveInput::Event(Ok(Some(event))) => event,
-        ActiveInput::Event(Ok(None)) => {
-            let error = GatewayError::new(
-                GatewayErrorKind::Internal,
-                "gateway response ended before its first event",
-            );
-            return send_gateway_error(connection, &error, &request_id).await;
-        }
-        ActiveInput::Event(Err(error)) => {
-            return send_initial_engine_error(connection, &mut execution, &error, &request_id)
-                .await;
-        }
-        ActiveInput::Disconnect => return ForwardOutcome::Disconnect,
-    };
-    let requirement = first.commit_requirement();
-    let mut first = first.into_provider_events();
-    if requirement != CommitRequirement::CommitBeforeDelivery {
-        let error = GatewayError::new(
-            GatewayErrorKind::Internal,
-            "gateway first event did not require commit",
-        );
-        return send_gateway_error(connection, &error, &request_id).await;
-    }
     let mut encoder = OpenAiResponsesEncoder::new();
     let mut provider_state = None;
     let mut first_messages = Vec::new();
-    for event in &mut first {
-        if let Some(update) = event.take_session_update() {
-            provider_state = Some(update);
+    // Codex can emit private metadata before `response.created`. That batch is
+    // still Core's commit boundary; commit it without forwarding the private
+    // event, then consume public events through the committed loop below.
+    while first_messages.is_empty() {
+        let first = match next_active_input(connection, &mut execution).await {
+            ActiveInput::Event(Ok(Some(event))) => event,
+            ActiveInput::Event(Ok(None)) => {
+                let error = GatewayError::new(
+                    GatewayErrorKind::Internal,
+                    "gateway response ended before its first public event",
+                );
+                return send_gateway_error(connection, &error, &request_id).await;
+            }
+            ActiveInput::Event(Err(error)) => {
+                return send_initial_engine_error(connection, &mut execution, &error, &request_id)
+                    .await;
+            }
+            ActiveInput::Disconnect => return ForwardOutcome::Disconnect,
+        };
+        if first.commit_requirement() != CommitRequirement::CommitBeforeDelivery {
+            let error = GatewayError::new(
+                GatewayErrorKind::Internal,
+                "gateway first public event did not require commit",
+            );
+            return send_gateway_error(connection, &error, &request_id).await;
         }
-        first_messages.extend(encoder.push_websocket(event));
-    }
-    if first_messages.is_empty() {
-        let error = GatewayError::new(
-            GatewayErrorKind::Internal,
-            "gateway commit batch encoded no output",
-        );
-        return send_gateway_error(connection, &error, &request_id).await;
+        let events = first.into_provider_events();
+        let only_private_metadata =
+            !events.is_empty() && events.iter().all(is_private_provider_event);
+        for mut event in events {
+            if let Some(update) = event.take_session_update() {
+                provider_state = Some(update);
+            }
+            first_messages.extend(encoder.push_websocket(&event));
+        }
+        if first_messages.is_empty() && !only_private_metadata {
+            let error = GatewayError::new(
+                GatewayErrorKind::Internal,
+                "gateway commit batch encoded no output",
+            );
+            return send_gateway_error(connection, &error, &request_id).await;
+        }
+        if only_private_metadata {
+            break;
+        }
     }
     let Some(response_session) = execution.session_mut() else {
         return ForwardOutcome::Disconnect;

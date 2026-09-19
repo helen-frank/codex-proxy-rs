@@ -1,5 +1,7 @@
 //! Provider OpenAI Responses wire 到客户端 transport 的透明转发边界。
 
+use std::collections::BTreeMap;
+
 use bytes::Bytes;
 use gateway_core::event::{GatewayEvent, ProtocolWireEvent, ProviderEvent};
 use gateway_protocol::openai::sse::{
@@ -23,6 +25,8 @@ pub struct OpenAiResponsesEncoder {
     response_snapshot: Option<Value>,
     wire_terminal: Option<Value>,
     wire_failure: bool,
+    completed_output_items: BTreeMap<u64, Value>,
+    completed_output_items_without_index: Vec<Value>,
 }
 
 impl OpenAiResponsesEncoder {
@@ -34,6 +38,8 @@ impl OpenAiResponsesEncoder {
             response_snapshot: None,
             wire_terminal: None,
             wire_failure: false,
+            completed_output_items: BTreeMap::new(),
+            completed_output_items_without_index: Vec::new(),
         }
     }
 
@@ -43,9 +49,16 @@ impl OpenAiResponsesEncoder {
         let Some(wire) = openai_wire(event) else {
             return Vec::new();
         };
+        if is_private_provider_wire_event(wire) {
+            return Vec::new();
+        }
         self.observe_wire(wire);
         let projected = client_failure_payload(wire);
-        let data = projected.as_ref().unwrap_or_else(|| wire.data());
+        let reconstructed = self.reconstructed_terminal_event(wire);
+        let data = projected
+            .as_ref()
+            .or(reconstructed.as_ref())
+            .unwrap_or_else(|| wire.data());
         // 当前 Codex 不消费 Responses `error` event，会在 EOF 时丢失失败原因。
         // 在客户端 SSE 边界统一投影成它能识别的 `response.failed`。
         if effective_event_type(wire) == Some("error")
@@ -63,6 +76,7 @@ impl OpenAiResponsesEncoder {
             ))];
         }
         if projected.is_none()
+            && reconstructed.is_none()
             && let Some(raw_sse_frame) = wire.raw_sse_frame()
         {
             return vec![raw_sse_frame.clone()];
@@ -81,9 +95,16 @@ impl OpenAiResponsesEncoder {
         let Some(wire) = openai_wire(event).filter(|wire| wire.has_json_data()) else {
             return Vec::new();
         };
+        if is_private_provider_wire_event(wire) {
+            return Vec::new();
+        }
         self.observe_wire(wire);
         let projected = client_failure_payload(wire);
-        let data = projected.as_ref().unwrap_or_else(|| wire.data());
+        let reconstructed = self.reconstructed_terminal_event(wire);
+        let data = projected
+            .as_ref()
+            .or(reconstructed.as_ref())
+            .unwrap_or_else(|| wire.data());
         // WS 客户端只对它无法消费的裸 `error` 帧做投影：codex 的 WS 端点
         // 会静默忽略缺少 status 且不含内置可重试错误码的 `error` 帧，客户
         // 端只能空等到 idle 超时。投影成 `response.failed`（消息 JSON 自带
@@ -141,6 +162,16 @@ impl OpenAiResponsesEncoder {
     }
 
     fn observe_wire(&mut self, wire: &ProtocolWireEvent) {
+        if effective_event_type(wire) == Some("response.output_item.done")
+            && let Some(item) = wire.data().get("item").filter(|item| item.is_object())
+        {
+            if let Some(output_index) = wire.data().get("output_index").and_then(Value::as_u64) {
+                self.completed_output_items
+                    .insert(output_index, item.clone());
+            } else {
+                self.completed_output_items_without_index.push(item.clone());
+            }
+        }
         if let Some(response_id) = wire
             .data()
             .pointer("/response/id")
@@ -164,10 +195,40 @@ impl OpenAiResponsesEncoder {
             effective_type,
             Some("response.completed" | "response.incomplete")
         ) {
-            self.wire_terminal = wire.data().get("response").cloned();
+            self.wire_terminal = self
+                .reconstructed_terminal_event(wire)
+                .and_then(|event| event.get("response").cloned())
+                .or_else(|| wire.data().get("response").cloned());
         } else if matches!(effective_type, Some("response.failed" | "error")) {
             self.wire_failure = true;
         }
+    }
+
+    fn reconstructed_terminal_event(&self, wire: &ProtocolWireEvent) -> Option<Value> {
+        if !matches!(
+            effective_event_type(wire),
+            Some("response.completed" | "response.incomplete")
+        ) || wire
+            .data()
+            .pointer("/response/output")
+            .and_then(Value::as_array)
+            .is_some_and(|output| !output.is_empty())
+            || (self.completed_output_items.is_empty()
+                && self.completed_output_items_without_index.is_empty())
+        {
+            return None;
+        }
+
+        let mut event = wire.data().clone();
+        let response = event.get_mut("response")?.as_object_mut()?;
+        let mut output = self
+            .completed_output_items
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        output.extend(self.completed_output_items_without_index.iter().cloned());
+        response.insert("output".to_owned(), Value::Array(output));
+        Some(event)
     }
 }
 
@@ -175,6 +236,18 @@ fn openai_wire(event: &ProviderEvent) -> Option<&ProtocolWireEvent> {
     event
         .wire_event()
         .filter(|wire| wire.protocol() == OPENAI_PROTOCOL)
+}
+
+pub(super) fn is_private_provider_event(event: &ProviderEvent) -> bool {
+    openai_wire(event).is_some_and(is_private_provider_wire_event)
+}
+
+fn is_private_provider_wire_event(wire: &ProtocolWireEvent) -> bool {
+    effective_event_type(wire).is_some_and(|event_type| {
+        event_type == "response.metadata"
+            || event_type.starts_with("codex.")
+            || event_type.starts_with("responsesapi.")
+    })
 }
 
 fn effective_event_type(wire: &ProtocolWireEvent) -> Option<&str> {

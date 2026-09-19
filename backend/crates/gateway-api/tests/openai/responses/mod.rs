@@ -174,6 +174,37 @@ fn decoder_should_keep_transport_override_out_of_the_openai_wire_body() {
 }
 
 #[test]
+fn decoder_should_preserve_http_sse_transport_by_default() {
+    let decoded = generate_request(json!({
+        "model": "smart-code",
+        "input": "hello"
+    }));
+
+    assert_eq!(
+        openai_protocol_context(&decoded).get("use_websocket"),
+        Some(&json!(false))
+    );
+}
+
+#[test]
+fn websocket_decoder_should_preserve_websocket_transport_by_default() {
+    let decoded = decode_response_create(
+        &json!({
+            "type": "response.create",
+            "model": "smart-code",
+            "input": "hello"
+        })
+        .to_string(),
+    )
+    .expect("WebSocket response.create should decode");
+
+    assert_eq!(
+        openai_protocol_context(&decoded).get("use_websocket"),
+        Some(&json!(true))
+    );
+}
+
+#[test]
 fn decoder_should_preserve_unrecognized_use_websocket_values() {
     let decoded = generate_request(json!({
         "model": "smart-code",
@@ -185,7 +216,10 @@ fn decoder_should_preserve_unrecognized_use_websocket_values() {
         openai_wire_body(&decoded).get("use_websocket"),
         Some(&json!({"future": "transport-mode"}))
     );
-    assert!(!openai_protocol_context(&decoded).contains_key("use_websocket"));
+    assert_eq!(
+        openai_protocol_context(&decoded).get("use_websocket"),
+        Some(&json!(false))
+    );
 }
 
 #[test]
@@ -216,6 +250,7 @@ fn decoder_should_preserve_connection_metadata_outside_the_openai_wire_body() {
             ("turn_state".to_owned(), json!("turn-state")),
             ("turn_metadata".to_owned(), json!("{\"kind\":\"review\"}")),
             ("conversation_id".to_owned(), json!("conversation")),
+            ("use_websocket".to_owned(), json!(false)),
             (
                 "opaque_request_headers".to_owned(),
                 json!([
@@ -808,6 +843,56 @@ fn transparent_encoder_should_use_identical_json_for_sse_and_websocket() {
 }
 
 #[test]
+fn encoder_should_reconstruct_empty_terminal_output_from_completed_items() {
+    let item = json!({
+        "id": "msg_1",
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "OK"}]
+    });
+    let item_done = openai_wire_event(
+        Vec::new(),
+        "response.output_item.done",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": item
+        }),
+    );
+    let completed = openai_wire_event(
+        Vec::new(),
+        "response.completed",
+        json!({
+            "type": "response.completed",
+            "response": {"id": "resp_1", "status": "completed", "output": []}
+        }),
+    );
+    let mut sse_encoder = OpenAiResponsesEncoder::new();
+    let mut websocket_encoder = OpenAiResponsesEncoder::new();
+
+    sse_encoder.push_sse(&item_done);
+    websocket_encoder.push_websocket(&item_done);
+    let sse = sse_encoder.push_sse(&completed);
+    let websocket = websocket_encoder.push_websocket(&completed);
+    let sse_text = String::from_utf8(sse[0].to_vec()).expect("SSE is UTF-8");
+    let sse_data = parse_sse_events(&sse_text).expect("SSE parses")[0]
+        .data
+        .clone();
+    let websocket_data = serde_json::from_str::<Value>(&websocket[0]).expect("WebSocket JSON");
+
+    assert_eq!(
+        serde_json::from_str::<Value>(&sse_data).expect("SSE JSON"),
+        websocket_data
+    );
+    assert_eq!(websocket_data["response"]["output"], json!([item]));
+    assert_eq!(
+        sse_encoder.finish().expect("terminal response")["output"],
+        json!([item])
+    );
+}
+
+#[test]
 fn transparent_encoder_should_translate_error_wire_to_response_failed_for_websocket() {
     // codex 的 WS 端点只消费带 status 的包装错误帧；上游缺少 status 的裸
     // `error` 帧会被静默忽略，客户端只能空等到 idle 超时。WS 边界与 SSE
@@ -1018,6 +1103,35 @@ fn capacity_client_projection_does_not_touch_other_codes_or_non_failure_events()
         assert_eq!(
             OpenAiResponsesEncoder::new().push_websocket(&event),
             vec![original.to_string()]
+        );
+    }
+}
+
+#[test]
+fn encoder_should_strip_provider_private_events_from_both_downstream_transports() {
+    for event_type in [
+        "response.metadata",
+        "codex.response.metadata",
+        "codex.rate_limits",
+        "responsesapi.websocket_timing",
+    ] {
+        let event = openai_wire_event(
+            Vec::new(),
+            event_type,
+            json!({
+                "type": event_type,
+                "headers": {
+                    "x-codex-turn-state": "private-turn-state",
+                    "x-openai-model": "provider-reported-model"
+                }
+            }),
+        );
+
+        assert!(OpenAiResponsesEncoder::new().push_sse(&event).is_empty());
+        assert!(
+            OpenAiResponsesEncoder::new()
+                .push_websocket(&event)
+                .is_empty()
         );
     }
 }
