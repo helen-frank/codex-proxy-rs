@@ -204,14 +204,17 @@ Token 直接覆盖时不会自动重算同组件的其他状态；需要保持�
 Input、Select、Textarea 与 NumberInput 共用 Input Component Token，普通按钮和图标按钮分别使用 Button Secondary 与
 Icon Button Secondary Token。组件合同统一，明暗配方分别派生：浅色需要改善宿主背景上的辨识度，暗色保留已有的
 Surface 混色与填充层次，不把浅色配方直接套入暗色。暗色输入的聚焦态直接复用原有 Hover 背景与外圈，
-浅色两态都使用 Container 背景与浅蓝外圈，保证点击前后不切换形态。
+浅色两态都使用 Container 背景与半透明主色外圈，保证点击前后不切换形态。
 
-浅色控件常态使用 7.5% 透明填充，按钮 Hover / Active 分别使用 10.5% / 14%。色源保留 `colorTextBase` 的色相与
-饱和度，明度向白色提升一半，避免近黑色直接叠白后发灰。透明填充随页面、卡片和浮层的宿主背景自然合成。
+浅色填充与 Surface 共用外观距离，色源和透明度同步平滑过渡。中性基线的色源保留 `colorTextBase` 的色相与
+饱和度，明度向白色提升一半；控件常态、按钮 Hover / Active 的透明度为 7.5% / 10.5% / 14%，避免直接叠白后发灰。
+带色温主题直接使用文字 Seed，常态取 Secondary Fill 强度的 78%，按钮 Hover / Active 为 9% / 12%，
+保留与 Surface 一致的深浅层级。透明填充随页面、卡片和浮层的宿主背景自然合成。
 输入控件常态保持无边，Hover 与 Focus 均使用 Container 背景（默认浅色为白色）和同色、同宽的 3px 半透明主色
 外圈；两种状态的外圈都不受装饰性阴影强度影响。暗色同样将 Hover 与 Focus 的背景、外圈和装饰阴影统一派生。
 
-浅色表头、斑马纹、行 Hover 使用独立的内容填充，透明度为 9.5% / 4.5% / 9%，让斑马纹可辨、Hover 再深一档。
+浅色表头、斑马纹、行 Hover 使用独立的内容填充，中性基线透明度为 9.5% / 4.5% / 9%；带色温主题分别复用
+Tertiary / Quaternary / Tertiary 的混色强度（6% / 3.5% / 6%），让斑马纹可辨、Hover 再深一档。
 这些值先与 Container 合成为不透明背景，避免固定列透出滚动内容。暗色表头、斑马纹和行 Hover 继续分别消费
 Tertiary Fill、Quaternary Fill 和 Text Hover，保持已有颜色。
 表格数据单元格的背景统一使用 150ms 淡入淡出，覆盖普通行、斑马纹和选中行，固定列同步过渡；系统偏好减少动态效果时关闭。

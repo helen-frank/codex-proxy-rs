@@ -54,21 +54,39 @@ const SURFACE_MAP_DERIVERS = {
   dark: deriveNeutralDarkSurfaceMap,
 } satisfies Record<ThemeName, (seedTokens: ResolvedThemeSeedTokens) => ThemeSurfaceMap>
 
+const LIGHT_SURFACE_MIX = {
+  secondary: 0.09,
+  tertiary: 0.06,
+  quaternary: 0.035,
+} as const
+
+// 中性基线使用提亮色源；带色温主题复用 Surface 层级，避免填充被二次弱化。
 const LIGHT_FILL_OPACITIES = {
-  controlBg: 0.075,
-  controlHoverBg: 0.105,
-  controlActiveBg: 0.14,
-  contentBg: 0.095,
-  contentStripeBg: 0.045,
-  contentHoverBg: 0.09,
-} satisfies Record<keyof ThemeFillMap, number>
+  controlBg: [0.075, LIGHT_SURFACE_MIX.secondary * 0.78],
+  controlHoverBg: [0.105, LIGHT_SURFACE_MIX.secondary],
+  controlActiveBg: [0.14, LIGHT_SURFACE_MIX.tertiary * 2],
+  contentBg: [0.095, LIGHT_SURFACE_MIX.tertiary],
+  contentStripeBg: [0.045, LIGHT_SURFACE_MIX.quaternary],
+  contentHoverBg: [0.09, LIGHT_SURFACE_MIX.tertiary],
+} satisfies Record<keyof ThemeFillMap, [number, number]>
 
 export function deriveLightThemeFillMap(seedTokens: ResolvedThemeSeedTokens): ThemeFillMap {
-  // 先提亮色源并保留色相与饱和度，避免近黑色低透明度叠白后发灰。
-  const fillColor = mixColorTone(WHITE, seedTokens.colorTextBase, 0.5)
+  const appearanceInfluence = deriveSurfaceAppearanceInfluence(
+    seedTokens.colorBgBase,
+    seedTokens.colorTextBase,
+    LIGHT_CONTAINER_BASE,
+    LIGHT_TEXT_BASE,
+  )
+  const fillColor = mix(
+    mixColorTone(WHITE, seedTokens.colorTextBase, 0.5),
+    seedTokens.colorTextBase,
+    appearanceInfluence,
+  )
   const fills = {} as ThemeFillMap
-  for (const name of Object.keys(LIGHT_FILL_OPACITIES) as (keyof ThemeFillMap)[])
-    fills[name] = withAlpha(fillColor, LIGHT_FILL_OPACITIES[name])
+  for (const name of Object.keys(LIGHT_FILL_OPACITIES) as (keyof ThemeFillMap)[]) {
+    const [neutralOpacity, appearanceOpacity] = LIGHT_FILL_OPACITIES[name]
+    fills[name] = withAlpha(fillColor, neutralOpacity + (appearanceOpacity - neutralOpacity) * appearanceInfluence)
+  }
   return fills
 }
 
@@ -400,15 +418,15 @@ function deriveNeutralLightSurfaceMap(
     mix(neutral, chromatic, appearanceInfluence)
   const colorFillQuaternary = adaptiveTone(
     LIGHT_SURFACE_ANCHORS.colorFillQuaternary,
-    mix(background, colorText, 0.035),
+    mix(background, colorText, LIGHT_SURFACE_MIX.quaternary),
   )
   const colorFillTertiary = adaptiveTone(
     LIGHT_SURFACE_ANCHORS.colorFillTertiary,
-    mix(background, colorText, 0.06),
+    mix(background, colorText, LIGHT_SURFACE_MIX.tertiary),
   )
   const colorFillSecondary = adaptiveTone(
     LIGHT_SURFACE_ANCHORS.colorFillSecondary,
-    mix(background, colorText, 0.09),
+    mix(background, colorText, LIGHT_SURFACE_MIX.secondary),
   )
   const colorBorderSecondary = adaptiveTone(
     LIGHT_SURFACE_ANCHORS.colorBorderSecondary,
