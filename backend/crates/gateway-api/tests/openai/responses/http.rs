@@ -641,14 +641,11 @@ async fn request_context_should_resolve_forwarded_precedence_and_peer_fallback()
             input: Some(json!("hello")),
             client_metadata: None,
             // 客户端 User-Agent 仅用于本地展示，不再透传给上游指纹上下文。
-            protocol_context: Some(json!({
-                "opaque_request_headers": [
-                    ["cf-connecting-ip", STANDARD.encode(b"198.51.100.1")],
-                    ["x-real-ip", STANDARD.encode(b"198.51.100.2")],
-                    ["x-forwarded-for", STANDARD.encode(b"10.0.0.2, 203.0.113.3")]
-                ],
-                "use_websocket": false
-            })),
+            protocol_context: Some(json!({"opaque_request_headers": [
+                ["cf-connecting-ip", STANDARD.encode(b"198.51.100.1")],
+                ["x-real-ip", STANDARD.encode(b"198.51.100.2")],
+                ["x-forwarded-for", STANDARD.encode(b"10.0.0.2, 203.0.113.3")]
+            ]})),
             prompt_cache_key: None,
             previous_response_id: None,
         }
@@ -687,8 +684,7 @@ async fn opaque_client_headers_should_not_change_local_client_observation() {
             "opaque_request_headers": [
                 ["x-stainless-runtime", STANDARD.encode(b"node")],
                 ["origin", STANDARD.encode(b"https://synthetic.invalid")]
-            ],
-            "use_websocket": false
+            ]
         }))
     );
 }
@@ -813,8 +809,7 @@ async fn xai_private_headers_should_remain_opaque_without_projecting_request_fac
             "opaque_request_headers": [
                 ["x-grok-turn-idx", STANDARD.encode(b"7")],
                 ["x-grok-conv-id", STANDARD.encode(b"private-session")]
-            ],
-            "use_websocket": false
+            ]
         }))
     );
     assert!(captured.prompt_cache_key.is_none());
@@ -838,45 +833,6 @@ async fn streaming_encodes_first_frame_before_commit_and_http_delivery() {
     assert_eq!(trace.snapshot(), vec!["next_event", "commit"]);
     assert!(!trace.is_cancelled());
     std::mem::forget(response);
-}
-
-#[tokio::test]
-async fn streaming_skips_private_metadata_before_first_public_frame() {
-    let trace = Arc::new(Trace::default());
-    let private_metadata = ProviderEvent::wire(
-        ProtocolWireEvent::json(
-            "openai",
-            Some("codex.response.metadata".to_owned()),
-            json!({
-                "type": "codex.response.metadata",
-                "headers": {"x-codex-turn-state": "opaque"}
-            }),
-        )
-        .expect("private metadata wire event"),
-    );
-    let session = FakeSession::streaming(
-        Arc::clone(&trace),
-        vec![
-            NextStep::Event(delivery_provider(
-                private_metadata,
-                CommitRequirement::CommitBeforeDelivery,
-            )),
-            NextStep::Event(delivery(started(), CommitRequirement::AlreadyCommitted)),
-        ],
-    );
-
-    let response = stream_execution_response(Box::new(session), None).await;
-    assert_eq!(response.status(), axum::http::StatusCode::OK);
-    let mut body = response.into_body().into_data_stream();
-    let first = body.next().await.expect("first frame").expect("body bytes");
-    let first = String::from_utf8(first.to_vec()).expect("SSE is UTF-8");
-
-    assert!(first.contains("response.created"), "first chunk: {first:?}");
-    assert!(!first.contains("codex.response.metadata"));
-    assert_eq!(trace.client_statuses(), vec![200]);
-    assert_eq!(trace.snapshot(), vec!["next_event", "commit", "next_event"]);
-    assert!(!trace.is_cancelled());
-    std::mem::forget(body);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1060,7 +1016,13 @@ async fn streaming_response_should_append_ordinary_headers_and_skip_unrepresenta
 
     let response = stream_execution_response(Box::new(session), None).await;
 
-    assert!(response.headers().get("x-models-etag").is_none());
+    assert_eq!(
+        response
+            .headers()
+            .get("x-models-etag")
+            .and_then(|value| value.to_str().ok()),
+        Some("models-v2")
+    );
     assert_eq!(
         response
             .headers()

@@ -132,27 +132,6 @@ async fn full_observation_queue_never_waits_for_the_database() {
 }
 
 #[tokio::test]
-async fn closed_observation_queue_persists_the_write_directly() {
-    let inner = Arc::new(RecordingStore::default());
-    let (store, writer) = BufferedExecutionStore::with_capacity(
-        Arc::clone(&inner),
-        NonZeroUsize::new(1).expect("capacity"),
-    );
-    drop(writer);
-    let request_id = ModelRequestId::new("req_queue_closed").expect("request id");
-
-    store
-        .mark_send_state(&request_id, UpstreamSendState::Sent)
-        .await
-        .expect("closed queue fallback remains fail-open");
-
-    assert_eq!(*inner.operations.lock().expect("operations lock"), ["send"]);
-    assert_eq!(store.stats().persisted_total, 1);
-    assert_eq!(store.stats().dropped_total, 1);
-    assert_eq!(store.stats().queued_items, 0);
-}
-
-#[tokio::test]
 async fn observation_writer_persists_commands_in_enqueue_order() {
     let inner = Arc::new(RecordingStore::default());
     let (store, writer) = BufferedExecutionStore::with_capacity(

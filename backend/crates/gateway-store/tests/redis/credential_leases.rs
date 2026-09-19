@@ -211,41 +211,6 @@ async fn scheduling_lease_ttl_and_cache_loss_rebuild_empty_runtime_signal() {
 }
 
 #[tokio::test]
-async fn live_scheduling_lease_is_renewed_until_release() {
-    let Some((repository, _connection, _namespace)) = repository().await else {
-        return;
-    };
-    let mut request = scheduling_request("acct_renewed", "worker-renewed", 1, Duration::ZERO);
-    request.ttl = Duration::from_millis(300);
-    let guard = acquired(
-        repository
-            .try_acquire_bounded_lease(&request)
-            .await
-            .expect("acquire renewable lease"),
-    );
-
-    tokio::time::sleep(Duration::from_millis(450)).await;
-    assert_eq!(
-        repository
-            .credential_runtime_signals(&[request.resource_id.clone()])
-            .await
-            .expect("load renewed runtime signal")[0]
-            .in_flight,
-        1
-    );
-
-    assert!(guard.release().await.expect("release renewed lease"));
-    assert_eq!(
-        repository
-            .credential_runtime_signals(&[request.resource_id.clone()])
-            .await
-            .expect("load released runtime signal")[0]
-            .in_flight,
-        0
-    );
-}
-
-#[tokio::test]
 async fn scheduling_cursor_is_shared_across_processes_and_isolated_by_client_and_provider() {
     let Some((repository, mut connection, namespace)) = repository().await else {
         return;

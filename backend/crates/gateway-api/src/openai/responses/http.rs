@@ -34,7 +34,7 @@ use crate::openai::{
 
 use super::{
     OpenAiResponsesEncoder, ProtocolErrorBody, ResponseEncodeError,
-    request::decode_request_with_headers, response::is_private_provider_event,
+    request::decode_request_with_headers,
 };
 
 const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
@@ -300,54 +300,44 @@ pub async fn stream_execution_response(
     connection_guard: Option<Box<dyn ConnectionGuard>>,
 ) -> Response {
     let mut execution = PendingExecution::new(session);
+    let Some(session) = execution.session_mut() else {
+        return internal_gateway_response("gateway response session is unavailable");
+    };
+    let first = match session.next_event().await {
+        Ok(Some(event)) => event,
+        Ok(None) => {
+            let response = gateway_error_response(&GatewayError::new(
+                GatewayErrorKind::Internal,
+                "gateway response ended before its first event",
+            ));
+            let response = execution.record_response_status(response).await;
+            execution.cancel_and_finalize().await;
+            return response;
+        }
+        Err(error) => {
+            let response_headers = session.response_headers().to_vec();
+            let response = engine_error_response_with_headers(&error, &response_headers);
+            return execution.record_response_status(response).await;
+        }
+    };
+    let first_requirement = first.commit_requirement();
+    let first_events = first.into_provider_events();
+    if first_requirement != CommitRequirement::CommitBeforeDelivery {
+        let response = internal_gateway_response("gateway first event did not require commit");
+        let response = execution.record_response_status(response).await;
+        execution.cancel_and_finalize().await;
+        return response;
+    }
     let mut encoder = OpenAiResponsesEncoder::new();
     let mut frames = Vec::new();
-    // Codex WebSocket can emit private metadata before `response.created`.
-    // The batch is still Core's commit boundary: commit the HTTP response with
-    // an empty body queue, then let the response stream consume public events.
-    while frames.is_empty() {
-        let Some(session) = execution.session_mut() else {
-            return internal_gateway_response("gateway response session is unavailable");
-        };
-        let first = match session.next_event().await {
-            Ok(Some(event)) => event,
-            Ok(None) => {
-                let response = gateway_error_response(&GatewayError::new(
-                    GatewayErrorKind::Internal,
-                    "gateway response ended before its first public event",
-                ));
-                let response = execution.record_response_status(response).await;
-                execution.cancel_and_finalize().await;
-                return response;
-            }
-            Err(error) => {
-                let response_headers = session.response_headers().to_vec();
-                let response = engine_error_response_with_headers(&error, &response_headers);
-                return execution.record_response_status(response).await;
-            }
-        };
-        if first.commit_requirement() != CommitRequirement::CommitBeforeDelivery {
-            let response =
-                internal_gateway_response("gateway first public event did not require commit");
-            let response = execution.record_response_status(response).await;
-            execution.cancel_and_finalize().await;
-            return response;
-        }
-        let events = first.into_provider_events();
-        let only_private_metadata =
-            !events.is_empty() && events.iter().all(is_private_provider_event);
-        for event in events {
-            frames.extend(encoder.push_sse(&event));
-        }
-        if frames.is_empty() && !only_private_metadata {
-            let response = internal_gateway_response("gateway commit batch encoded no output");
-            let response = execution.record_response_status(response).await;
-            execution.cancel_and_finalize().await;
-            return response;
-        }
-        if only_private_metadata {
-            break;
-        }
+    for event in &first_events {
+        frames.extend(encoder.push_sse(event));
+    }
+    if frames.is_empty() {
+        let response = internal_gateway_response("gateway commit batch encoded no output");
+        let response = execution.record_response_status(response).await;
+        execution.cancel_and_finalize().await;
+        return response;
     }
     let Some(session) = execution.session_mut() else {
         return internal_gateway_response("gateway response session is unavailable");

@@ -89,7 +89,7 @@ const clientUpstreamItems = computed(() => [
   { label: '事件类型', value: props.record?.kind, mono: true },
   { label: '尝试序号', value: finalAttemptIndex.value },
   {
-    label: '客户端 User-Agent（入口审计，不透传上游）',
+    label: 'User-Agent',
     value: props.record ? usageUserAgent(props.record) : '',
     mono: true,
     wrap: true,

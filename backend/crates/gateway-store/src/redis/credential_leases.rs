@@ -24,9 +24,7 @@ use crate::{Revision, StoreError, StoreResult, redis_unavailable, require_nonemp
 use super::{MAX_REDIS_EXACT_INTEGER, namespace, resource_fingerprint};
 
 const SIGNAL_TTL_MILLIS: u64 = 24 * 60 * 60 * 1_000;
-// Scheduling leases are heartbeats rather than request-deadline reservations.
-// Keep crash leftovers short; a live guard renews every third of this TTL.
-const PROVIDER_ACCOUNT_LEASE_TTL: Duration = Duration::from_secs(60);
+const PROVIDER_ACCOUNT_LEASE_TTL: Duration = Duration::from_secs(10 * 60);
 const OAUTH_REFRESH_LEASE_TTL: Duration = Duration::from_secs(5 * 60);
 const OAUTH_REFRESH_CAPACITY_RESOURCE: &str = "oauth-refresh-global";
 
@@ -230,44 +228,19 @@ impl fmt::Debug for CredentialBoundedLeaseAcquisition {
 }
 
 /// Drop 时在当前 Tokio runtime 上尽力释放；进程崩溃由 Redis TTL 回收。
-///
-/// 活跃请求会在后台续租，避免一个长响应超过初始 TTL 后被错误地计为
-/// 空闲并允许同一账号继续获得新的 scheduling lease。
 pub struct CredentialLeaseGuard {
     repository: RedisCredentialLeaseRepository,
     request: CredentialLeaseRequest,
     grant: Option<CredentialLeaseGrant>,
-    renewal: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl CredentialLeaseGuard {
-    fn new(
-        repository: RedisCredentialLeaseRepository,
-        request: CredentialLeaseRequest,
-        grant: CredentialLeaseGrant,
-    ) -> Self {
-        let renewal = tokio::spawn(renew_credential_lease_loop(
-            repository.clone(),
-            request.clone(),
-            grant.clone(),
-        ));
-        Self {
-            repository,
-            request,
-            grant: Some(grant),
-            renewal: Some(renewal),
-        }
-    }
-
     #[must_use]
     pub fn grant(&self) -> Option<&CredentialLeaseGrant> {
         self.grant.as_ref()
     }
 
     pub async fn release(mut self) -> StoreResult<bool> {
-        if let Some(renewal) = self.renewal.take() {
-            renewal.abort();
-        }
         let Some(grant) = self.grant.take() else {
             return Ok(false);
         };
@@ -291,9 +264,6 @@ impl fmt::Debug for CredentialLeaseGuard {
 
 impl Drop for CredentialLeaseGuard {
     fn drop(&mut self) {
-        if let Some(renewal) = self.renewal.take() {
-            renewal.abort();
-        }
         let Some(grant) = self.grant.take() else {
             return;
         };
@@ -305,33 +275,6 @@ impl Drop for CredentialLeaseGuard {
             }));
         }
     }
-}
-
-async fn renew_credential_lease_loop(
-    repository: RedisCredentialLeaseRepository,
-    request: CredentialLeaseRequest,
-    mut grant: CredentialLeaseGrant,
-) {
-    let interval = renewal_interval(request.ttl);
-    loop {
-        tokio::time::sleep(interval).await;
-        match repository.renew_credential_lease(&request, &grant).await {
-            Ok(Some(renewed)) => grant = renewed,
-            Ok(None) => {
-                tracing::warn!(scope = ?request.scope, "credential lease disappeared before renewal");
-                return;
-            }
-            Err(error) => {
-                tracing::warn!(scope = ?request.scope, error = %error, "credential lease renewal failed");
-            }
-        }
-    }
-}
-
-fn renewal_interval(ttl: Duration) -> Duration {
-    // Renew well before expiry, while keeping a useful retry window for a
-    // transient Redis error. A sub-second TTL is only used by tests/fixtures.
-    (ttl / 3).max(Duration::from_millis(100))
 }
 
 #[async_trait]
@@ -380,7 +323,11 @@ impl RedisCredentialLeaseRepository {
         request: CredentialLeaseRequest,
     ) -> StoreResult<Option<CredentialLeaseGuard>> {
         let grant = self.acquire_credential_lease(&request).await?;
-        Ok(grant.map(|grant| CredentialLeaseGuard::new(self.clone(), request, grant)))
+        Ok(grant.map(|grant| CredentialLeaseGuard {
+            repository: self.clone(),
+            request,
+            grant: Some(grant),
+        }))
     }
 
     /// 原子推进跨进程共享、按 Client Key 与 Provider 隔离的调度游标。
@@ -821,7 +768,11 @@ impl CredentialLeaseRepository for RedisCredentialLeaseRepository {
             .await?;
         match attempt.grant {
             Some(grant) => Ok(CredentialBoundedLeaseAcquisition::Acquired(
-                CredentialLeaseGuard::new(self.clone(), lease_request, grant),
+                CredentialLeaseGuard {
+                    repository: self.clone(),
+                    request: lease_request,
+                    grant: Some(grant),
+                },
             )),
             None => Ok(CredentialBoundedLeaseAcquisition::Busy {
                 retry_after: attempt.retry_after,

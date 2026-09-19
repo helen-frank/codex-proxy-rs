@@ -434,15 +434,10 @@ pub(super) fn decode_request_object(
     source: RequestDecodeSource,
 ) -> Result<DecodedResponsesRequest, RequestDecodeError> {
     // 仅消费已识别的本地 transport 开关；未知同名值保留给未来上游协议。
-    let requested_websocket = object.get("use_websocket").and_then(Value::as_bool);
-    if requested_websocket.is_some() {
+    let use_websocket = object.get("use_websocket").and_then(Value::as_bool);
+    if use_websocket.is_some() {
         object.remove("use_websocket");
     }
-    // Preserve the downstream transport by default. In particular, an HTTP/SSE
-    // Codex request must not be silently converted into an upstream WebSocket
-    // request; callers can still opt in through the existing local override.
-    let use_websocket =
-        requested_websocket.unwrap_or(matches!(source, RequestDecodeSource::WebSocketFrame));
 
     let model = required_non_empty_string(&object, "model", "model")?;
     if model.trim().is_empty() {
@@ -470,8 +465,7 @@ pub(super) fn decode_request_object(
         RequestDecodeSource::Http => None,
         RequestDecodeSource::WebSocketFrame => frame_turn_metadata(&object),
     };
-    let protocol_context =
-        request_headers.protocol_context(Some(use_websocket), frame_turn_metadata);
+    let protocol_context = request_headers.protocol_context(use_websocket, frame_turn_metadata);
 
     let payload = ProtocolPayload::json_object(OPENAI_PROTOCOL, object)
         .map_err(|_| RequestDecodeError::CanonicalContract {
