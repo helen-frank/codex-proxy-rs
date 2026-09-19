@@ -204,6 +204,7 @@ impl AccountProbe for SuccessfulProbe {
         Box::pin(async {
             Ok(AccountProbeResult {
                 text: vec!["OK".to_owned()],
+                upstream_response_model: None,
             })
         })
     }
