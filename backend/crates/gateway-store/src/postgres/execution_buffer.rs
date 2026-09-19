@@ -120,15 +120,16 @@ fn saturating_increment(counter: &AtomicU64, increment: u64) {
 
 /// 将数据面观测写入转换为有界、非阻塞的进程内命令。
 ///
-/// 队列满、worker 尚未启动或已经退出时只丢弃观测并记录告警；协议数据面不会
-/// 等待 PostgreSQL，也不会看到 Store 错误。启动恢复仍直接访问底层 Store。
+/// 队列满时只丢弃观测并记录告警；协议数据面不会看到 Store 错误。worker 已经
+/// 退出时直接补写底层 Store，避免已发送或已提交请求被恢复为未发送。启动恢复仍
+/// 直接访问底层 Store。
 pub struct BufferedExecutionStore<S: ?Sized> {
     inner: Arc<S>,
     sender: mpsc::Sender<QueuedExecutionObservation>,
     state: Arc<ExecutionBufferState>,
 }
 
-impl<S: ?Sized> BufferedExecutionStore<S> {
+impl<S: ExecutionStore + ?Sized> BufferedExecutionStore<S> {
     #[must_use]
     pub fn new(inner: Arc<S>) -> (Self, ExecutionObservationWriter<S>) {
         Self::with_capacity(
@@ -177,7 +178,7 @@ impl<S: ?Sized> BufferedExecutionStore<S> {
         self.state.snapshot()
     }
 
-    fn enqueue(&self, write: ExecutionObservationWrite) {
+    async fn enqueue(&self, write: ExecutionObservationWrite) {
         let estimated_bytes = write
             .estimated_bytes()
             .saturating_add(write.request_id().map_or(0, str::len))
@@ -207,6 +208,12 @@ impl<S: ?Sized> BufferedExecutionStore<S> {
                 };
                 let operation = queued.operation();
                 let request_id = queued.request_id().map(ToOwned::to_owned);
+                let mut queued = queued;
+                let fallback = if reason == "closed" {
+                    queued.take_write()
+                } else {
+                    None
+                };
                 drop(queued);
                 self.state.record_dropped(1);
                 let stats = self.state.snapshot();
@@ -219,6 +226,20 @@ impl<S: ?Sized> BufferedExecutionStore<S> {
                     dropped_total = stats.dropped_total,
                     "执行观测队列不可用，已丢弃本次写入"
                 );
+                if let Some(write) = fallback {
+                    match write.persist(self.inner.as_ref()).await {
+                        Ok(()) => self.state.record_persisted(),
+                        Err(error) => {
+                            self.state.record_write_failure();
+                            tracing::warn!(
+                                operation,
+                                request_id = ?request_id,
+                                error_kind = ?error.kind(),
+                                "执行观测队列关闭后的同步补写失败"
+                            );
+                        }
+                    }
+                }
             }
         }
     }
@@ -230,12 +251,14 @@ where
     S: ExecutionStore + ?Sized,
 {
     async fn create_model_request(&self, request: NewModelRequest) -> Result<(), StoreError> {
-        self.enqueue(ExecutionObservationWrite::Create(Box::new(request)));
+        self.enqueue(ExecutionObservationWrite::Create(Box::new(request)))
+            .await;
         Ok(())
     }
 
     async fn record_attempt(&self, attempt: AttemptRecord) -> Result<(), StoreError> {
-        self.enqueue(ExecutionObservationWrite::Attempt(Box::new(attempt)));
+        self.enqueue(ExecutionObservationWrite::Attempt(Box::new(attempt)))
+            .await;
         Ok(())
     }
 
@@ -246,7 +269,8 @@ where
     ) -> Result<(), StoreError> {
         self.enqueue(ExecutionObservationWrite::CreateWithAttempt(Box::new((
             request, attempt,
-        ))));
+        ))))
+        .await;
         Ok(())
     }
 
@@ -258,7 +282,8 @@ where
         self.enqueue(ExecutionObservationWrite::MarkSendState {
             request_id: request_id.clone(),
             state,
-        });
+        })
+        .await;
         Ok(())
     }
 
@@ -272,7 +297,8 @@ where
             request_id: request_id.clone(),
             committed_at,
             client_status_code,
-        });
+        })
+        .await;
         Ok(())
     }
 
@@ -284,7 +310,8 @@ where
         self.enqueue(ExecutionObservationWrite::RecordClientStatus {
             request_id: request_id.clone(),
             client_status_code,
-        });
+        })
+        .await;
         Ok(())
     }
 
@@ -294,12 +321,14 @@ where
     ) -> Result<(), StoreError> {
         self.enqueue(ExecutionObservationWrite::IntermediateFailure(Box::new(
             failure,
-        )));
+        )))
+        .await;
         Ok(())
     }
 
     async fn record_probe_failure(&self, failure: ProbeFailure) -> Result<(), StoreError> {
-        self.enqueue(ExecutionObservationWrite::ProbeFailure(Box::new(failure)));
+        self.enqueue(ExecutionObservationWrite::ProbeFailure(Box::new(failure)))
+            .await;
         Ok(())
     }
 
@@ -307,7 +336,8 @@ where
         &self,
         finalization: ModelRequestFinalization,
     ) -> Result<(), StoreError> {
-        self.enqueue(ExecutionObservationWrite::Finalize(Box::new(finalization)));
+        self.enqueue(ExecutionObservationWrite::Finalize(Box::new(finalization)))
+            .await;
         Ok(())
     }
 
